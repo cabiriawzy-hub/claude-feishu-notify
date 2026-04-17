@@ -197,9 +197,11 @@ case "$raw_msg" in
     else
       last_text=""
       if [[ -n "$transcript" && -f "$transcript" ]]; then
-        last_text=$(tail -50 "$transcript" 2>/dev/null \
-          | jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' 2>/dev/null \
-          | tail -1 | tr -d '[:space:]' | tail -c 3)
+        last_text=$(tail -200 "$transcript" 2>/dev/null \
+          | jq -c 'select(.type=="assistant") | . as $r | ([.message.content[]? | select(.type=="text") | .text] | join(" ")) as $t | select($t != "" and ($t | test("^No response requested\\.?$") | not)) | $t' 2>/dev/null \
+          | tail -1 \
+          | jq -r '.' 2>/dev/null \
+          | tr -d '[:space:]' | tail -c 3)
       fi
       if [[ "$last_text" == *"?" || "$last_text" == *"？" ]]; then
         friendly="❓ Claude 问你问题呢，回个话～"
