@@ -10,6 +10,8 @@ set -euo pipefail
 OPEN_ID="__OPEN_ID__"
 LOG="/tmp/claude-notify.log"
 IDLE_MARKER="/tmp/claude-notify-active.marker"
+SEEN_DIR="/tmp/claude-notify-seen"
+mkdir -p "$SEEN_DIR"
 
 payload=$(cat || true)
 transcript=$(printf '%s' "$payload" | jq -r '.transcript_path // ""' 2>/dev/null || echo "")
@@ -17,12 +19,29 @@ cwd=$(printf '%s' "$payload" | jq -r '.cwd // ""' 2>/dev/null || echo "")
 
 [[ -z "$transcript" || ! -f "$transcript" ]] && exit 0
 
-# Grab the last assistant record; bail if it's not an API error.
-last=$(tail -30 "$transcript" 2>/dev/null | jq -c 'select(.type == "assistant")' 2>/dev/null | tail -1)
+# On API errors, Claude Code often doesn't fire Stop until the user /compacts
+# or retries — by which point a plain `tail -30` has moved past the error record.
+# Widen the window and filter by timestamp + isApiErrorMessage, then dedup by uuid
+# so we never double-fire on the same error.
+cutoff_iso=$(date -u -v-10M '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+  || date -u -d '10 minutes ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+  || echo "")
+
+last=$(tail -300 "$transcript" 2>/dev/null \
+  | jq -c --arg cutoff "$cutoff_iso" \
+      'select(.type == "assistant" and .isApiErrorMessage == true and (($cutoff == "") or ((.timestamp // "") > $cutoff)))' \
+      2>/dev/null \
+  | tail -1)
+
 [[ -z "$last" ]] && exit 0
 
-is_err=$(printf '%s' "$last" | jq -r '.isApiErrorMessage // false' 2>/dev/null)
-[[ "$is_err" != "true" ]] && exit 0
+err_uuid=$(printf '%s' "$last" | jq -r '.uuid // ""' 2>/dev/null)
+if [[ -n "$err_uuid" ]]; then
+  seen_file="${SEEN_DIR}/${err_uuid}"
+  [[ -f "$seen_file" ]] && exit 0
+  touch "$seen_file"
+  find "$SEEN_DIR" -type f -mtime +7 -delete 2>/dev/null || true
+fi
 
 err_text=$(printf '%s' "$last" | jq -r '.message.content[0].text // ""' 2>/dev/null)
 
@@ -67,6 +86,7 @@ content=$(jq -n --arg t "$text" '{text:$t}')
 
 {
   echo "=== $(date '+%F %T') [error-notify] ==="
+  echo "uuid: $err_uuid"
   echo "err: $(printf '%s' "$err_text" | head -c 200)"
   echo "sent: $text"
   resp=$(lark-cli im +messages-send \
