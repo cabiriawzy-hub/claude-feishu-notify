@@ -247,7 +247,14 @@ else
   text="${friendly}"
 fi
 
-content=$(jq -n --arg t "$text" '{text:$t}')
+# iTerm2 click-to-focus: append localhost URL handled by claude-focus-daemon.
+# Silently skipped when not running inside iTerm2 (SSH, Terminal.app, Ghostty…).
+if [[ "${TERM_PROGRAM:-}" == "iTerm.app" && -n "${ITERM_SESSION_ID:-}" ]]; then
+  uuid="${ITERM_SESSION_ID##*:}"
+  if [[ "$uuid" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+    text="${text}"$'\n'"🖥️ [点这里切回来](http://localhost:47823/focus?id=${uuid})"
+  fi
+fi
 
 {
   echo "=== $(date '+%F %T') ==="
@@ -255,8 +262,7 @@ content=$(jq -n --arg t "$text" '{text:$t}')
   echo "sent: $text"
   resp=$(lark-cli im +messages-send \
     --user-id "$OPEN_ID" \
-    --msg-type text \
-    --content "$content" \
+    --markdown "$text" \
     --as bot 2>&1) || true
   printf '%s\n' "$resp" | head -5
 
