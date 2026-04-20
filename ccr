@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Claude Code Remote (ccr) — CLI for the v3 daemon.
+#
+# v3 model: daemon runs via LaunchAgent (RunAtLoad + KeepAlive), hooks are
+# always wired. Remote approval is ON by default; `ccr disable` toggles it
+# off with a marker file. CLI commands:
+#
+#   ccr status    mode + launchd + daemon health + presence + recent log
+#   ccr enable    remove disable marker (default state)
+#   ccr disable   create disable marker (hooks become no-ops)
+#   ccr restart   unload + reload the LaunchAgent
+#   ccr log       tail daemon log
+set -euo pipefail
+
+PLIST="$HOME/Library/LaunchAgents/com.claude.ccr.plist"
+LABEL="com.claude.ccr"
+DISABLED_MARKER="/tmp/ccr-disabled.marker"
+LOG="/tmp/ccr-daemon.log"
+DAEMON_URL="http://127.0.0.1:19837"
+
+uid=$(id -u)
+target="gui/$uid"
+
+load_if_needed() {
+  if ! launchctl print "$target/$LABEL" >/dev/null 2>&1; then
+    launchctl bootstrap "$target" "$PLIST"
+    echo "ccr: daemon loaded"
+  fi
+}
+
+cmd_enable() {
+  rm -f "$DISABLED_MARKER"
+  load_if_needed
+  echo "ccr: enabled (remote approval active)"
+}
+
+cmd_disable() {
+  touch "$DISABLED_MARKER"
+  echo "ccr: disabled (hooks no-op; local permission UI only)"
+}
+
+cmd_restart() {
+  if launchctl print "$target/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$target/$LABEL" || true
+  fi
+  sleep 1
+  launchctl bootstrap "$target" "$PLIST"
+  echo "ccr: daemon reloaded"
+  sleep 1
+  cmd_status
+}
+
+cmd_status() {
+  if [[ -f "$DISABLED_MARKER" ]]; then
+    echo "mode: ⚪ disabled ($DISABLED_MARKER present)"
+  else
+    echo "mode: 🟢 enabled"
+  fi
+  if launchctl print "$target/$LABEL" >/dev/null 2>&1; then
+    echo "launchd: loaded"
+  else
+    echo "launchd: NOT loaded — run 'ccr enable' or restart"
+  fi
+  health=$(curl -sS -m 2 "$DAEMON_URL/healthz" 2>/dev/null || echo "")
+  if [[ -n "$health" ]]; then
+    echo "health:   $health"
+  else
+    echo "health:   ❌ daemon unreachable"
+  fi
+  presence=$(curl -sS -m 3 "$DAEMON_URL/presence" 2>/dev/null || echo "")
+  if [[ -n "$presence" ]]; then
+    echo "presence: $presence"
+  fi
+  echo "--- last 5 log lines ---"
+  tail -5 "$LOG" 2>/dev/null || echo "(no log yet)"
+}
+
+cmd_log() {
+  tail -f "$LOG"
+}
+
+case "${1:-}" in
+  enable)  cmd_enable ;;
+  disable) cmd_disable ;;
+  status)  cmd_status ;;
+  restart) cmd_restart ;;
+  log)     cmd_log ;;
+  *)
+    cat <<EOF
+Claude Code Remote (ccr) — Feishu card approval for Claude Code
+
+usage: ccr <command>
+
+  status    show mode, launchd, daemon health, presence, recent log
+  enable    enable remote approval (default state)
+  disable   disable: hooks become no-ops, only local permission UI
+  restart   unload + reload the LaunchAgent
+  log       tail daemon log
+
+When enabled (default) and you're away from the computer (locked or
+frontmost app isn't a terminal), Claude's risky tool uses and idle
+notifications are sent to your phone as Feishu cards. When you're at
+the computer with a terminal in front, the daemon short-circuits and
+Claude Code's native local prompt handles the decision.
+EOF
+    exit 1
+    ;;
+esac

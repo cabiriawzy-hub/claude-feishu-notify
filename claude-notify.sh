@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Claude Code Notification hook → Feishu/Lark message (with urgent-app push).
-# Installed by the claude-feishu-notify skill. Edit OPEN_ID at the top if it changes.
+# Fires on Claude Code Notification events (permission prompt / idle 60s+).
+# Dedups to one Lark message per idle session via a marker file that's
+# cleared by the UserPromptSubmit hook when the user replies.
 set -euo pipefail
 
 [[ "${CLAUDE_NOTIFY_DISABLE:-}" == "1" ]] && exit 0
 
-OPEN_ID="__OPEN_ID__"
 MARKER="/tmp/claude-notify-active.marker"
 LOG="/tmp/claude-notify.log"
 
 [[ -f "$MARKER" ]] && exit 0
 
+# Translate a shell command into plain Chinese. Returns empty if no match.
 humanize_bash() {
   local c="$1"
+  # Strip leading env-var assignments (FOO=bar cmd ...)
   c=$(printf '%s' "$c" | sed -E 's/^([[:space:]]*[A-Z_][A-Z0-9_]*=[^[:space:]]+[[:space:]]+)+//; s/^[[:space:]]+//')
   case "$c" in
     "rm -rf"*)                          echo "⚠️ 删掉整个文件夹（不可逆！）" ;;
@@ -57,6 +59,10 @@ humanize_bash() {
     "lark-cli auth"*)                   echo "飞书登录/授权" ;;
     "lark-cli schema"*)                 echo "查飞书接口定义" ;;
     "lark-cli "*)                       echo "跑飞书命令" ;;
+    "paperclipai agent"*)               echo "操作 Paperclip 代理" ;;
+    "paperclipai inbox"*)               echo "看 Paperclip 收件箱" ;;
+    "paperclipai db:"*|"paperclipai "*"db "*) echo "⚠️ 查/改 Paperclip 数据库" ;;
+    "paperclipai "*)                    echo "跑 Paperclip 命令" ;;
     "python3 "*|"python "*)             echo "跑 Python 脚本" ;;
     "node "*)                           echo "跑 Node.js 脚本" ;;
     "bun "*)                            echo "跑 Bun 命令" ;;
@@ -91,6 +97,9 @@ raw_msg=$(printf '%s' "$payload" | jq -r '.message // ""' 2>/dev/null || echo ""
 cwd=$(printf '%s' "$payload" | jq -r '.cwd // ""' 2>/dev/null || echo "")
 transcript=$(printf '%s' "$payload" | jq -r '.transcript_path // ""' 2>/dev/null || echo "")
 
+# Peek at the last tool_use in the transcript to describe what Claude wants to do.
+# The Notification fires while the tool is queued awaiting permission, so the
+# most recent tool_use is the one we're being asked about.
 perm_tool=""
 if [[ "$raw_msg" == *"permission to use "* ]]; then
   perm_tool=$(printf '%s' "$raw_msg" | sed -E 's/.*permission to use ([A-Za-z_]+).*/\1/')
@@ -98,7 +107,21 @@ fi
 
 action=""
 last_tool=""
-if [[ -n "$transcript" && -f "$transcript" ]]; then
+
+# Prefer the pending-tool marker written by claude-ccr.sh — it's authoritative
+# for the CURRENT tool awaiting permission/answer. Transcript can lag
+# (AskUserQuestion's tool_use only flushes after the user answers).
+PENDING_TOOL_MARKER="/tmp/ccr-pending-tool.json"
+if [[ -f "$PENDING_TOOL_MARKER" ]]; then
+  # Only trust marker if recent (within 10 minutes) — stale marker means
+  # PostToolUse failed to clean up; fall back to transcript.
+  if [[ $(($(date +%s) - $(stat -f %m "$PENDING_TOOL_MARKER" 2>/dev/null || echo 0))) -lt 600 ]]; then
+    last_tool=$(jq -r '.tool // ""' "$PENDING_TOOL_MARKER" 2>/dev/null || echo "")
+    action=$(jq -r '.action // ""' "$PENDING_TOOL_MARKER" 2>/dev/null || echo "")
+  fi
+fi
+
+if [[ -z "$last_tool" && -n "$transcript" && -f "$transcript" ]]; then
   if [[ -n "$perm_tool" ]]; then
     last_tu=$(tail -200 "$transcript" 2>/dev/null \
       | jq -c --arg t "$perm_tool" 'select(.message.content? | type=="array") | .message.content[]? | select(.type=="tool_use" and .name == $t)' 2>/dev/null \
@@ -142,7 +165,8 @@ if [[ -n "$transcript" && -f "$transcript" ]]; then
         action="搜代码 ${p}"
         ;;
       AskUserQuestion)
-        q=$(printf '%s' "$last_tu" | jq -r '.input.questions[0].question // ""' | cut -c1-50)
+        q=$(printf '%s' "$last_tu" | jq -r '.input.questions[0].question // ""' \
+          | /usr/bin/python3 -c 'import sys; s=sys.stdin.read().strip().replace("\n"," "); print(s[:30] + ("…" if len(s)>30 else ""), end="")')
         action="问你「${q}」"
         ;;
       TaskCreate|TaskUpdate|TaskGet|TaskList)
@@ -175,8 +199,14 @@ if [[ -n "$transcript" && -f "$transcript" ]]; then
   fi
 fi
 
+# Map Claude Code's English notification to plain Chinese with emoji.
+# silence_if_at_computer: suppress Feishu when user is at computer.
+#   - "permission to use" / "needs attention" fire immediately when prompt
+#     appears; user already sees local menu, no phone ping needed
+#   - "waiting for input" fires AFTER ~60s idle; user may have drifted, send
 friendly=""
 urgent=0
+silence_if_at_computer=false
 case "$raw_msg" in
   *"permission to use "*)
     tool=$(printf '%s' "$raw_msg" | sed -E 's/.*permission to use ([A-Za-z_]+).*/\1/')
@@ -186,6 +216,7 @@ case "$raw_msg" in
       friendly="🐾 Claude 想用 ${tool} 干点小事，同意一下喽～"
     fi
     urgent=1
+    silence_if_at_computer=true
     ;;
   *"permission"*|*"Permission"*)
     if [[ -n "$action" ]]; then
@@ -194,12 +225,19 @@ case "$raw_msg" in
       friendly="✋ Claude 卡住啦，点个同意我就继续～"
     fi
     urgent=1
+    silence_if_at_computer=true
     ;;
   *"waiting for your input"*|*"waiting for input"*)
     if [[ "$last_tool" == "AskUserQuestion" ]]; then
       friendly="🙋 Claude ${action}，帮我选一个～"
       urgent=1
     else
+      # Heuristic: if Claude's last assistant text ends with a question
+      # mark, treat it as a blocking question and urgent-ping.
+      # Find the last assistant record that actually HAS text (skip pure
+      # tool_use turns), then join its text blocks. Skip "No response
+      # requested." — Claude Code injects it into some sidechain transcripts
+      # and it's not a real assistant reply.
       last_text=""
       if [[ -n "$transcript" && -f "$transcript" ]]; then
         last_text=$(tail -200 "$transcript" 2>/dev/null \
@@ -225,6 +263,7 @@ case "$raw_msg" in
       friendly="🔔 Claude 有事找你，过来看一眼～"
     fi
     urgent=1
+    silence_if_at_computer=true
     ;;
   "")
     friendly="👀 Claude 找不到你啦，回来呀～"
@@ -235,6 +274,7 @@ case "$raw_msg" in
     ;;
 esac
 
+# Show ~/… for paths under $HOME, else last two path segments.
 project=""
 if [[ -n "$cwd" ]]; then
   if [[ "$cwd" == "$HOME" ]]; then
@@ -246,44 +286,39 @@ if [[ -n "$cwd" ]]; then
   fi
 fi
 
-if [[ -n "$project" ]]; then
-  text="${friendly} 📂 ${project}"
-else
-  text="${friendly}"
-fi
+text="${friendly}"
 
-# iTerm2 click-to-focus: append localhost URL handled by claude-focus-daemon.
-# Silently skipped when not running inside iTerm2 (SSH, Terminal.app, Ghostty…).
+# iTerm click-to-focus URL; the daemon renders it as a card button.
+focus_url=""
 if [[ "${TERM_PROGRAM:-}" == "iTerm.app" && -n "${ITERM_SESSION_ID:-}" ]]; then
   uuid="${ITERM_SESSION_ID##*:}"
   if [[ "$uuid" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
-    text="${text}"$'\n'"🖥️ [点这里切回来](http://localhost:47823/focus?id=${uuid})"
+    focus_url="http://localhost:47823/focus?id=${uuid}"
   fi
 fi
+
+body=$(jq -n --arg text "$text" --arg cwd "$cwd" \
+  --arg url "$focus_url" --argjson urgent "$urgent" \
+  --argjson silence "$silence_if_at_computer" \
+  '{text:$text, cwd:$cwd, iterm_focus_url:$url, urgent:($urgent==1),
+    silence_if_at_computer:$silence}')
 
 {
   echo "=== $(date '+%F %T') ==="
   echo "raw: $raw_msg"
   echo "sent: $text"
-  resp=$(lark-cli im +messages-send \
-    --user-id "$OPEN_ID" \
-    --markdown "$text" \
-    --as bot 2>&1) || true
+  resp=$(curl -sS --max-time 15 -X POST http://127.0.0.1:19837/notify \
+    -H 'Content-Type: application/json' \
+    -d "$body" 2>&1) || true
   printf '%s\n' "$resp" | head -5
-
-  if [[ "$urgent" == "1" ]]; then
-    mid=$(printf '%s' "$resp" | jq -r '.data.message_id // .message_id // empty' 2>/dev/null)
-    if [[ -n "$mid" ]]; then
-      echo "urgent_app for $mid"
-      lark-cli api PATCH "/open-apis/im/v1/messages/${mid}/urgent_app" \
-        --params '{"user_id_type":"open_id"}' \
-        --data "{\"user_id_list\":[\"${OPEN_ID}\"]}" \
-        --as bot 2>&1 | head -5 || echo "(urgent failed)"
-    else
-      echo "(no message_id — skip urgent)"
-    fi
-  fi
 } >> "$LOG" 2>&1
 
-touch "$MARKER"
+# Only mark "already notified" if daemon actually delivered. If daemon skipped
+# (e.g. permission notification while at_computer), leave MARKER unset so the
+# follow-up "waiting for input" notification at t=60s+ can still fire.
+if printf '%s' "$resp" | grep -q '"skipped"'; then
+  echo "resp indicated skip; MARKER not set" >> "$LOG"
+else
+  touch "$MARKER"
+fi
 exit 0
